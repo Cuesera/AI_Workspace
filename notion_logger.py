@@ -97,12 +97,34 @@ def parse_hook_data(raw: dict, transcript: list) -> dict:
 
     user_count = sum(1 for e in transcript if e.get("type") == "user")
 
+    # 프로젝트 디렉토리 내에서 현재 존재하는 파일만 포함, 임시/시스템 파일 제외
+    cwd_norm = os.path.normcase(os.path.abspath(cwd))
+    EXCLUDE_EXTS = {".log", ".jsonl"}
+    EXCLUDE_PREFIXES = {"hook_", "debug_", "test_", "check_"}
+
+    def _is_project_file(f: str) -> bool:
+        try:
+            if not os.path.exists(f):
+                return False
+            if not os.path.normcase(os.path.abspath(f)).startswith(cwd_norm):
+                return False
+            name = os.path.basename(f)
+            if any(name.startswith(p) for p in EXCLUDE_PREFIXES):
+                return False
+            if os.path.splitext(name)[1] in EXCLUDE_EXTS:
+                return False
+            return True
+        except (ValueError, OSError):
+            return False
+
+    filtered_files = sorted({f for f in files_touched if _is_project_file(f)})
+
     return {
         "session_id":    session_id,
         "project_name":  project_name,
         "cwd":           cwd,
         "tools_used":    sorted(tools_used),
-        "files_touched": sorted(files_touched),
+        "files_touched": filtered_files,
         "first_request": user_messages[0] if user_messages else "(내용 없음)",
         "message_count": user_count,
     }
@@ -132,7 +154,9 @@ def summarize_with_haiku(parsed: dict, transcript: list) -> str:
     prompt = (
         f"Claude Code 작업 세션 (프로젝트: {parsed['project_name']}):\n\n"
         + "\n".join(texts)
-        + "\n\n위 작업을 3~5문장 한국어로 요약해주세요. 무엇을 만들었는지, 어떤 문제를 해결했는지 중심으로."
+        + "\n\n위 작업을 3~5문장 한국어 평문으로 요약해주세요. "
+        + "마크다운 헤더(#)나 볼드(**) 없이 순수 텍스트로만 작성하세요. "
+        + "무엇을 만들었는지, 어떤 문제를 해결했는지 중심으로."
     )
 
     try:
@@ -311,46 +335,71 @@ def create_db_entry(parsed: dict, summary: str) -> str:
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
+def write_run_log(msg: str):
+    """Hook 발동 여부를 항상 기록 (디버그와 무관하게)"""
+    log_path = os.path.join(os.path.dirname(__file__), "logs", "hook_run.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
 def main():
+    write_run_log("[시작]")
+
     if not NOTION_API_KEY or not NOTION_LOG_DB_ID:
+        write_run_log("[종료] 환경변수 미설정")
         sys.exit(0)
 
     try:
         raw_input = sys.stdin.read()
         if not raw_input.strip():
+            write_run_log("[종료] stdin 비어있음")
             sys.exit(0)
         raw = json.loads(raw_input)
-    except Exception:
+        write_run_log(f"[파싱] session={raw.get('session_id','?')[:8]}")
+    except Exception as e:
+        write_run_log(f"[오류] stdin 파싱 실패: {e}")
         sys.exit(0)
 
-    # JSONL 파일에서 트랜스크립트 로드
-    transcript = load_transcript(raw)
-
-    if DEBUG_MODE:
-        debug_path = os.path.join(os.path.dirname(__file__), "hook_debug.json")
-        with open(debug_path, "w", encoding="utf-8") as f:
-            json.dump({"raw": raw, "transcript_count": len(transcript)}, f, ensure_ascii=False, indent=2)
-
-    parsed = parse_hook_data(raw, transcript)
-
-    if parsed["message_count"] == 0:
-        sys.exit(0)
-
-    if USE_HAIKU_SUMMARY:
-        summary = summarize_with_haiku(parsed, transcript)
-    else:
-        tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
-        summary   = f"사용 도구: {tools_str} / 수정 파일 {len(parsed['files_touched'])}개"
-
-    notion_url = ""
     try:
-        notion_url = create_db_entry(parsed, summary)
-        print(f"[Notion 저장 완료] {notion_url}", file=sys.stderr)
-    except requests.HTTPError as e:
-        print(f"[Notion 저장 실패] {e.response.status_code}: {e.response.text}", file=sys.stderr)
+        # JSONL 파일에서 트랜스크립트 로드
+        transcript = load_transcript(raw)
+        write_run_log(f"[로드] transcript {len(transcript)}줄")
 
-    md_path = save_md_log(parsed, summary, notion_url)
-    print(f"[MD 저장 완료] {md_path}", file=sys.stderr)
+        if DEBUG_MODE:
+            debug_path = os.path.join(os.path.dirname(__file__), "hook_debug.json")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump({"raw": raw, "transcript_count": len(transcript)}, f, ensure_ascii=False, indent=2)
+
+        parsed = parse_hook_data(raw, transcript)
+        write_run_log(f"[파싱] 메시지={parsed['message_count']} 도구={len(parsed['tools_used'])}")
+
+        if parsed["message_count"] == 0:
+            write_run_log("[종료] 메시지 없음")
+            sys.exit(0)
+
+        if USE_HAIKU_SUMMARY:
+            summary = summarize_with_haiku(parsed, transcript)
+        else:
+            tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
+            summary   = f"사용 도구: {tools_str} / 수정 파일 {len(parsed['files_touched'])}개"
+
+        write_run_log(f"[요약] {summary[:60]}...")
+
+        notion_url = ""
+        try:
+            notion_url = create_db_entry(parsed, summary)
+            write_run_log(f"[Notion 완료] {notion_url}")
+        except requests.HTTPError as e:
+            write_run_log(f"[Notion 실패] {e.response.status_code}: {e.response.text[:100]}")
+
+        md_path = save_md_log(parsed, summary, notion_url)
+        write_run_log(f"[MD 완료] {md_path}")
+
+    except Exception as e:
+        import traceback
+        write_run_log(f"[오류] {e}")
+        write_run_log(traceback.format_exc().replace('\n', ' | '))
 
 
 if __name__ == "__main__":
