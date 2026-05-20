@@ -31,10 +31,29 @@ NOTION_HEADERS = {
 KNOWN_TOOLS = {"Write", "Edit", "Read", "Bash", "Glob", "Grep", "WebFetch", "TodoWrite"}
 
 
+# ── JSONL 트랜스크립트 로드 ────────────────────────────────────────────────────
+
+def load_transcript(raw: dict) -> list:
+    """transcript_path의 JSONL 파일을 읽어 메시지 리스트 반환"""
+    transcript_path = raw.get("transcript_path", "")
+    if transcript_path and os.path.exists(transcript_path):
+        messages = []
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        messages.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return messages
+    # 폴백: 인라인 transcript (이전 방식 호환)
+    return raw.get("transcript", [])
+
+
 # ── 데이터 파싱 ────────────────────────────────────────────────────────────────
 
-def parse_hook_data(raw: dict) -> dict:
-    transcript = raw.get("transcript", [])
+def parse_hook_data(raw: dict, transcript: list) -> dict:
     cwd        = raw.get("cwd", "unknown")
     session_id = raw.get("session_id", "unknown")
     project_name = os.path.basename(cwd) if cwd != "unknown" else "unknown"
@@ -43,8 +62,14 @@ def parse_hook_data(raw: dict) -> dict:
     files_touched = set()
     user_messages = []
 
-    for msg in transcript:
-        role    = msg.get("role", "")
+    for entry in transcript:
+        # JSONL 포맷: {"type":"user"|"assistant", "message": {"role":..., "content":[...]}}
+        entry_type = entry.get("type", "")
+        if entry_type not in ("user", "assistant"):
+            continue
+
+        msg     = entry.get("message", entry)  # 폴백: 인라인 포맷 호환
+        role    = msg.get("role", entry_type)
         content = msg.get("content", "")
 
         if isinstance(content, str):
@@ -70,6 +95,8 @@ def parse_hook_data(raw: dict) -> dict:
             if role == "user" and btype == "text":
                 user_messages.append(block.get("text", "")[:300])
 
+    user_count = sum(1 for e in transcript if e.get("type") == "user")
+
     return {
         "session_id":    session_id,
         "project_name":  project_name,
@@ -77,7 +104,7 @@ def parse_hook_data(raw: dict) -> dict:
         "tools_used":    sorted(tools_used),
         "files_touched": sorted(files_touched),
         "first_request": user_messages[0] if user_messages else "(내용 없음)",
-        "message_count": len([m for m in transcript if m.get("role") == "user"]),
+        "message_count": user_count,
     }
 
 
@@ -88,8 +115,12 @@ def summarize_with_haiku(parsed: dict, transcript: list) -> str:
         return "(ANTHROPIC_API_KEY 미설정)"
 
     texts = []
-    for msg in transcript[-30:]:
-        role    = msg.get("role", "")
+    for entry in transcript[-40:]:
+        entry_type = entry.get("type", "")
+        if entry_type not in ("user", "assistant"):
+            continue
+        msg     = entry.get("message", entry)
+        role    = msg.get("role", entry_type)
         content = msg.get("content", "")
         if isinstance(content, str) and content.strip():
             texts.append(f"{role}: {content[:300]}")
@@ -292,18 +323,21 @@ def main():
     except Exception:
         sys.exit(0)
 
+    # JSONL 파일에서 트랜스크립트 로드
+    transcript = load_transcript(raw)
+
     if DEBUG_MODE:
         debug_path = os.path.join(os.path.dirname(__file__), "hook_debug.json")
         with open(debug_path, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+            json.dump({"raw": raw, "transcript_count": len(transcript)}, f, ensure_ascii=False, indent=2)
 
-    parsed = parse_hook_data(raw)
+    parsed = parse_hook_data(raw, transcript)
 
     if parsed["message_count"] == 0:
         sys.exit(0)
 
     if USE_HAIKU_SUMMARY:
-        summary = summarize_with_haiku(parsed, raw.get("transcript", []))
+        summary = summarize_with_haiku(parsed, transcript)
     else:
         tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
         summary   = f"사용 도구: {tools_str} / 수정 파일 {len(parsed['files_touched'])}개"
