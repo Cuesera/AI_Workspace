@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+hook_debug.json

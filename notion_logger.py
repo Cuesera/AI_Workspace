@@ -176,6 +176,59 @@ def build_page_blocks(parsed: dict, summary: str) -> list:
     return blocks
 
 
+# ── 로컬 .md 파일 저장 ────────────────────────────────────────────────────────────
+
+def save_md_log(parsed: dict, summary: str, notion_url: str = "") -> str:
+    """logs/ 폴더에 세션 로그를 .md 파일로 저장, 파일 경로 반환"""
+    now      = datetime.now(KST)
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+
+    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # 같은 날 같은 프로젝트 세션이 여러 개일 경우 덮어쓰지 않고 번호 부여
+    base_name = f"{date_str}_{parsed['project_name']}"
+    file_path = os.path.join(logs_dir, f"{base_name}.md")
+    if os.path.exists(file_path):
+        idx = 2
+        while os.path.exists(os.path.join(logs_dir, f"{base_name}_{idx}.md")):
+            idx += 1
+        file_path = os.path.join(logs_dir, f"{base_name}_{idx}.md")
+
+    tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
+    files_str = "\n".join(f"- {f}" for f in parsed["files_touched"]) or "없음"
+    notion_line = f"\n**Notion:** {notion_url}" if notion_url else ""
+
+    content = f"""# [{date_str}] {parsed['project_name']} 작업 로그
+
+**날짜:** {date_str} {time_str} KST{notion_line}
+**메시지 수:** {parsed['message_count']}개
+**사용 도구:** {tools_str}
+
+## 작업 요약
+
+{summary}
+
+## 첫 번째 요청
+
+> {parsed['first_request']}
+
+## 수정/생성된 파일
+
+{files_str}
+
+---
+
+📂 `{parsed['cwd']}`
+"""
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return file_path
+
+
 # ── Notion DB row 생성 ─────────────────────────────────────────────────────────
 
 def create_db_entry(parsed: dict, summary: str) -> str:
@@ -255,11 +308,15 @@ def main():
         tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
         summary   = f"사용 도구: {tools_str} / 수정 파일 {len(parsed['files_touched'])}개"
 
+    notion_url = ""
     try:
-        url = create_db_entry(parsed, summary)
-        print(f"[Notion 로그 저장 완료] {url}", file=sys.stderr)
+        notion_url = create_db_entry(parsed, summary)
+        print(f"[Notion 저장 완료] {notion_url}", file=sys.stderr)
     except requests.HTTPError as e:
         print(f"[Notion 저장 실패] {e.response.status_code}: {e.response.text}", file=sys.stderr)
+
+    md_path = save_md_log(parsed, summary, notion_url)
+    print(f"[MD 저장 완료] {md_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
