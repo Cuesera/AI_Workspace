@@ -17,7 +17,6 @@ NOTION_API_KEY  = os.getenv("NOTION_API_KEY")
 NOTION_LOG_DB_ID = os.getenv("NOTION_LOG_DB_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 USE_HAIKU_SUMMARY = os.getenv("NOTION_USE_HAIKU", "false").lower() == "true"
-DEBUG_MODE        = os.getenv("NOTION_LOGGER_DEBUG", "false").lower() == "true"
 
 KST = timezone(timedelta(hours=9))
 
@@ -136,27 +135,35 @@ def summarize_with_haiku(parsed: dict, transcript: list) -> str:
     if not ANTHROPIC_API_KEY:
         return "(ANTHROPIC_API_KEY 미설정)"
 
-    texts = []
-    for entry in transcript[-40:]:
-        entry_type = entry.get("type", "")
-        if entry_type not in ("user", "assistant"):
+    # 사용자 요청만 추출 (어시스턴트 응답 제외), 최대 5개
+    user_msgs = []
+    for entry in transcript:
+        if entry.get("type") != "user":
             continue
         msg     = entry.get("message", entry)
-        role    = msg.get("role", entry_type)
         content = msg.get("content", "")
-        if isinstance(content, str) and content.strip():
-            texts.append(f"{role}: {content[:300]}")
+        text    = ""
+        if isinstance(content, str):
+            text = content.strip()
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    texts.append(f"{role}: {block.get('text','')[:300]}")
+                    text = block.get("text", "").strip()
+                    break
+        if text:
+            user_msgs.append(text[:200])
+        if len(user_msgs) >= 5:
+            break
+
+    files_str = "\n".join(f"- {f}" for f in parsed["files_touched"]) or "없음"
 
     prompt = (
-        f"Claude Code 작업 세션 (프로젝트: {parsed['project_name']}):\n\n"
-        + "\n".join(texts)
-        + "\n\n위 작업을 3~5문장 한국어 평문으로 요약해주세요. "
-        + "마크다운 헤더(#)나 볼드(**) 없이 순수 텍스트로만 작성하세요. "
-        + "무엇을 만들었는지, 어떤 문제를 해결했는지 중심으로."
+        f"프로젝트: {parsed['project_name']}\n\n"
+        f"사용자 요청:\n" + "\n".join(f"{i+1}. {m}" for i, m in enumerate(user_msgs)) +
+        f"\n\n수정된 파일:\n{files_str}\n\n"
+        "위 내용을 2~3문장 한국어로 요약하세요. "
+        "무엇을 만들었는지, 어떤 문제를 해결했는지 중심으로. "
+        "마크다운 없이 순수 텍스트로."
     )
 
     try:
@@ -167,7 +174,7 @@ def summarize_with_haiku(parsed: dict, transcript: list) -> str:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 500,
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
@@ -234,7 +241,7 @@ def build_page_blocks(parsed: dict, summary: str) -> list:
 # ── 로컬 .md 파일 저장 ────────────────────────────────────────────────────────────
 
 def save_md_log(parsed: dict, summary: str, notion_url: str = "") -> str:
-    """logs/ 폴더에 세션 로그를 .md 파일로 저장, 파일 경로 반환"""
+    """날짜별 단일 .md 파일에 세션을 append"""
     now      = datetime.now(KST)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
@@ -242,44 +249,36 @@ def save_md_log(parsed: dict, summary: str, notion_url: str = "") -> str:
     logs_dir = os.path.join(os.path.dirname(__file__), "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
-    # 같은 날 같은 프로젝트 세션이 여러 개일 경우 덮어쓰지 않고 번호 부여
-    base_name = f"{date_str}_{parsed['project_name']}"
-    file_path = os.path.join(logs_dir, f"{base_name}.md")
+    file_path = os.path.join(logs_dir, f"{date_str}.md")
+
+    # 기존 파일의 세션 수 카운트
+    session_num = 1
     if os.path.exists(file_path):
-        idx = 2
-        while os.path.exists(os.path.join(logs_dir, f"{base_name}_{idx}.md")):
-            idx += 1
-        file_path = os.path.join(logs_dir, f"{base_name}_{idx}.md")
+        with open(file_path, "r", encoding="utf-8") as f:
+            session_num = f.read().count("## 세션") + 1
 
-    tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
-    files_str = "\n".join(f"- {f}" for f in parsed["files_touched"]) or "없음"
-    notion_line = f"\n**Notion:** {notion_url}" if notion_url else ""
+    files_str   = "\n".join(f"- {f}" for f in parsed["files_touched"]) or "없음"
+    notion_line = f"  |  [Notion]({notion_url})" if notion_url else ""
 
-    content = f"""# [{date_str}] {parsed['project_name']} 작업 로그
+    session_block = f"""
+## 세션 {session_num} — {time_str}{notion_line}
 
-**날짜:** {date_str} {time_str} KST{notion_line}
-**메시지 수:** {parsed['message_count']}개
-**사용 도구:** {tools_str}
+**{summary}**
 
-## 작업 요약
+> {parsed['first_request'][:200]}
 
-{summary}
-
-## 첫 번째 요청
-
-> {parsed['first_request']}
-
-## 수정/생성된 파일
-
+**수정/생성 파일 ({len(parsed['files_touched'])}개)**
 {files_str}
 
----
+---"""
 
-📂 `{parsed['cwd']}`
-"""
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    if session_num == 1:
+        header = f"# {date_str}  |  {parsed['project_name']}\n"
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(header + session_block + "\n")
+    else:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(session_block + "\n")
 
     return file_path
 
@@ -335,71 +334,47 @@ def create_db_entry(parsed: dict, summary: str) -> str:
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
-def write_run_log(msg: str):
-    """Hook 발동 여부를 항상 기록 (디버그와 무관하게)"""
-    log_path = os.path.join(os.path.dirname(__file__), "logs", "hook_run.log")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-
-
 def main():
-    write_run_log("[시작]")
-
     if not NOTION_API_KEY or not NOTION_LOG_DB_ID:
-        write_run_log("[종료] 환경변수 미설정")
         sys.exit(0)
 
     try:
         raw_input = sys.stdin.read()
         if not raw_input.strip():
-            write_run_log("[종료] stdin 비어있음")
             sys.exit(0)
         raw = json.loads(raw_input)
-        write_run_log(f"[파싱] session={raw.get('session_id','?')[:8]}")
-    except Exception as e:
-        write_run_log(f"[오류] stdin 파싱 실패: {e}")
+    except Exception:
         sys.exit(0)
 
     try:
-        # JSONL 파일에서 트랜스크립트 로드
         transcript = load_transcript(raw)
-        write_run_log(f"[로드] transcript {len(transcript)}줄")
-
-        if DEBUG_MODE:
-            debug_path = os.path.join(os.path.dirname(__file__), "hook_debug.json")
-            with open(debug_path, "w", encoding="utf-8") as f:
-                json.dump({"raw": raw, "transcript_count": len(transcript)}, f, ensure_ascii=False, indent=2)
-
         parsed = parse_hook_data(raw, transcript)
-        write_run_log(f"[파싱] 메시지={parsed['message_count']} 도구={len(parsed['tools_used'])}")
 
-        if parsed["message_count"] == 0:
-            write_run_log("[종료] 메시지 없음")
+        if parsed["message_count"] < 3 and not parsed["files_touched"]:
             sys.exit(0)
 
         if USE_HAIKU_SUMMARY:
             summary = summarize_with_haiku(parsed, transcript)
         else:
-            tools_str = ", ".join(parsed["tools_used"]) if parsed["tools_used"] else "없음"
-            summary   = f"사용 도구: {tools_str} / 수정 파일 {len(parsed['files_touched'])}개"
-
-        write_run_log(f"[요약] {summary[:60]}...")
+            from collections import Counter
+            files = parsed["files_touched"]
+            if files:
+                ext_counts = Counter(os.path.splitext(f)[1] or "기타" for f in files)
+                ext_str = ", ".join(f"{ext}×{cnt}" for ext, cnt in ext_counts.most_common(3))
+                summary = f"파일 {len(files)}개 수정 ({ext_str}) · 메시지 {parsed['message_count']}개"
+            else:
+                summary = f"메시지 {parsed['message_count']}개 · 파일 변경 없음"
 
         notion_url = ""
         try:
             notion_url = create_db_entry(parsed, summary)
-            write_run_log(f"[Notion 완료] {notion_url}")
-        except requests.HTTPError as e:
-            write_run_log(f"[Notion 실패] {e.response.status_code}: {e.response.text[:100]}")
+        except requests.HTTPError:
+            pass
 
-        md_path = save_md_log(parsed, summary, notion_url)
-        write_run_log(f"[MD 완료] {md_path}")
+        save_md_log(parsed, summary, notion_url)
 
-    except Exception as e:
-        import traceback
-        write_run_log(f"[오류] {e}")
-        write_run_log(traceback.format_exc().replace('\n', ' | '))
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
